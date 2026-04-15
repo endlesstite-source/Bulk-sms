@@ -1,0 +1,4 @@
+node_modules/
+sms_marketing.db
+.env
+.DS_Store
