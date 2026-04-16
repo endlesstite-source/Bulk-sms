@@ -28,63 +28,48 @@ const TALKSASA_API_KEY = process.env.TALKSASA_API_KEY;
 const TALKSASA_SENDER_ID = process.env.TALKSASA_SENDER_ID || 'Talksasa';
 const TALKSASA_API_URL = 'https://bulksms.talksasa.com/api/v3/sms/send';
 
+// Format Kenyan phone number to international format
+function formatPhoneNumber(phone) {
+  let cleaned = phone.replace(/\s+/g, '').replace(/[()-]/g, '');
+  if (cleaned.startsWith('+')) cleaned = cleaned.substring(1);
+  if (cleaned.startsWith('0')) {
+    cleaned = '254' + cleaned.substring(1);
+  } else if (!cleaned.startsWith('254')) {
+    cleaned = '254' + cleaned;
+  }
+  return cleaned;
+}
+
 async function sendSms(recipientPhone, message) {
-  console.log(`[SMS] Sending to ${recipientPhone}`);
+  const formattedPhone = formatPhoneNumber(recipientPhone);
+  console.log(`[SMS] Sending to ${formattedPhone}`);
   
-  // Try simple string recipient first
-  const payload1 = {
+  const payload = {
     sender_id: TALKSASA_SENDER_ID,
-    recipient: recipientPhone,
+    recipient: formattedPhone,
     message: message
   };
   
   try {
-    const response = await axios.post(TALKSASA_API_URL, payload1, {
+    const response = await axios.post(TALKSASA_API_URL, payload, {
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${TALKSASA_API_KEY}`
       }
     });
-    console.log(`[SMS] SUCCESS (string recipient):`, response.data);
+    console.log(`[SMS] Response:`, response.data);
     if (response.data.status === 'success') {
       return { success: true, messageId: response.data.message_id || response.data.id };
     } else {
-      console.error(`[SMS] API returned error:`, response.data.message);
       return { success: false, error: response.data.message };
     }
   } catch (error) {
-    console.log(`[SMS] String recipient failed, trying object format...`);
-    
-    // Try object format
-    const payload2 = {
-      sender_id: TALKSASA_SENDER_ID,
-      recipient: { phone: recipientPhone },
-      message: message
-    };
-    
-    try {
-      const response = await axios.post(TALKSASA_API_URL, payload2, {
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${TALKSASA_API_KEY}`
-        }
-      });
-      console.log(`[SMS] SUCCESS (object recipient):`, response.data);
-      if (response.data.status === 'success') {
-        return { success: true, messageId: response.data.message_id || response.data.id };
-      } else {
-        console.error(`[SMS] API returned error:`, response.data.message);
-        return { success: false, error: response.data.message };
-      }
-    } catch (finalError) {
-      console.error(`[SMS] Both formats failed.`);
-      console.error(finalError.response?.data || finalError.message);
-      return { success: false, error: finalError.message };
-    }
+    console.error(`[SMS] Failed:`, error.response?.data || error.message);
+    return { success: false, error: error.message };
   }
 }
 
-// API Routes (unchanged)
+// API Routes
 app.get('/', (req, res) => res.send('SMS Marketing API is running.'));
 
 app.get('/api/groups', (req, res) => {
