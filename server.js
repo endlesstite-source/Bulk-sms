@@ -16,54 +16,20 @@ const dbPath = path.join(__dirname, 'sms_marketing.db');
 const db = new sqlite3.Database(dbPath);
 
 db.serialize(() => {
-  db.run(`CREATE TABLE IF NOT EXISTS groups (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT UNIQUE NOT NULL
-  )`);
-  db.run(`CREATE TABLE IF NOT EXISTS contacts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    phone TEXT UNIQUE NOT NULL,
-    first_name TEXT,
-    last_name TEXT,
-    group_id INTEGER,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (group_id) REFERENCES groups (id)
-  )`);
-  db.run(`CREATE TABLE IF NOT EXISTS templates (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT UNIQUE NOT NULL,
-    body TEXT NOT NULL
-  )`);
-  db.run(`CREATE TABLE IF NOT EXISTS campaigns (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    message TEXT NOT NULL,
-    group_id INTEGER,
-    scheduled_at DATETIME,
-    repeat_interval TEXT,
-    status TEXT DEFAULT 'draft',
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (group_id) REFERENCES groups (id)
-  )`);
-  db.run(`CREATE TABLE IF NOT EXISTS campaign_logs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    campaign_id INTEGER,
-    contact_id INTEGER,
-    message_id TEXT,
-    status TEXT,
-    cost REAL,
-    sent_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (campaign_id) REFERENCES campaigns (id),
-    FOREIGN KEY (contact_id) REFERENCES contacts (id)
-  )`);
-  db.get("SELECT id FROM groups WHERE name = 'All Contacts'", (err, row) => {
-    if (!row) db.run("INSERT INTO groups (name) VALUES ('All Contacts')");
-  });
+  db.run(`CREATE TABLE IF NOT EXISTS groups (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL)`);
+  db.run(`CREATE TABLE IF NOT EXISTS contacts (id INTEGER PRIMARY KEY AUTOINCREMENT, phone TEXT UNIQUE NOT NULL, first_name TEXT, last_name TEXT, group_id INTEGER, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (group_id) REFERENCES groups (id))`);
+  db.run(`CREATE TABLE IF NOT EXISTS templates (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL, body TEXT NOT NULL)`);
+  db.run(`CREATE TABLE IF NOT EXISTS campaigns (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, message TEXT NOT NULL, group_id INTEGER, scheduled_at DATETIME, repeat_interval TEXT, status TEXT DEFAULT 'draft', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (group_id) REFERENCES groups (id))`);
+  db.run(`CREATE TABLE IF NOT EXISTS campaign_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, campaign_id INTEGER, contact_id INTEGER, message_id TEXT, status TEXT, cost REAL, sent_at DATETIME DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (campaign_id) REFERENCES campaigns (id), FOREIGN KEY (contact_id) REFERENCES contacts (id))`);
+  db.get("SELECT id FROM groups WHERE name = 'All Contacts'", (err, row) => { if (!row) db.run("INSERT INTO groups (name) VALUES ('All Contacts')"); });
 });
 
 const TALKSASA_API_KEY = process.env.TALKSASA_API_KEY;
-const TALKSASA_API_URL = 'https://bulksms.talksasa.com/api/v3/sms/send';
 const TALKSASA_SENDER_ID = process.env.TALKSASA_SENDER_ID || 'Talksasa';
+const TALKSASA_API_URLS = [
+  'https://bulksms.talksasa.com/api/v3/sms/send',
+  'https://bulksms.talksasa.com/api/sms/send'
+];
 
 async function sendSms(recipientPhone, message) {
   console.log(`[SMS] Sending to ${recipientPhone}`);
@@ -72,21 +38,42 @@ async function sendSms(recipientPhone, message) {
     recipients: [{ phone: recipientPhone, name: '' }],
     message: message
   };
-  try {
-    const response = await axios.post(TALKSASA_API_URL, payload, {
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${TALKSASA_API_KEY}`
+
+  for (const url of TALKSASA_API_URLS) {
+    console.log(`[SMS] Trying URL: ${url}`);
+    
+    // Try Bearer token
+    try {
+      const response = await axios.post(url, payload, {
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${TALKSASA_API_KEY}`
+        }
+      });
+      console.log(`[SMS] SUCCESS with Bearer at ${url}:`, response.data);
+      return { success: true, messageId: response.data.message_id || response.data.id };
+    } catch (bearerError) {
+      console.log(`[SMS] Bearer failed at ${url}, trying api-key...`);
+      try {
+        const response = await axios.post(url, payload, {
+          headers: {
+            'Content-Type': 'application/json',
+            'api-key': TALKSASA_API_KEY
+          }
+        });
+        console.log(`[SMS] SUCCESS with api-key at ${url}:`, response.data);
+        return { success: true, messageId: response.data.message_id || response.data.id };
+      } catch (apiKeyError) {
+        console.error(`[SMS] api-key failed at ${url}:`, apiKeyError.response?.data || apiKeyError.message);
       }
-    });
-    console.log(`[SMS] SUCCESS:`, response.data);
-    return { success: true, messageId: response.data.message_id || response.data.id };
-  } catch (error) {
-    console.error(`[SMS] FAILED for ${recipientPhone}:`, error.response?.data || error.message);
-    return { success: false, error: error.message };
+    }
   }
+  
+  console.error(`[SMS] All attempts failed.`);
+  return { success: false, error: 'All authentication methods and URLs failed' };
 }
 
+// API Routes (same as before)
 app.get('/', (req, res) => res.send('SMS Marketing API is running.'));
 
 app.get('/api/groups', (req, res) => {
