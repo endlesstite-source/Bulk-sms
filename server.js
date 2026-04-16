@@ -25,10 +25,9 @@ db.serialize(() => {
 });
 
 const TALKSASA_API_KEY = process.env.TALKSASA_API_KEY;
-const TALKSASA_SENDER_ID = process.env.TALKSASA_SENDER_ID || 'Talksasa';
+const TALKSASA_SENDER_ID = process.env.TALKSASA_SENDER_ID || ''; // Optional now
 const TALKSASA_API_URL = 'https://bulksms.talksasa.com/api/v3/sms/send';
 
-// Format Kenyan phone number to international format
 function formatPhoneNumber(phone) {
   let cleaned = phone.replace(/\s+/g, '').replace(/[()-]/g, '');
   if (cleaned.startsWith('+')) cleaned = cleaned.substring(1);
@@ -45,10 +44,14 @@ async function sendSms(recipientPhone, message) {
   console.log(`[SMS] Sending to ${formattedPhone}`);
   
   const payload = {
-    sender_id: TALKSASA_SENDER_ID,
     recipient: formattedPhone,
     message: message
   };
+  
+  // Only include sender_id if it's set in environment
+  if (TALKSASA_SENDER_ID && TALKSASA_SENDER_ID.trim() !== '') {
+    payload.sender_id = TALKSASA_SENDER_ID;
+  }
   
   try {
     const response = await axios.post(TALKSASA_API_URL, payload, {
@@ -69,7 +72,7 @@ async function sendSms(recipientPhone, message) {
   }
 }
 
-// API Routes
+// API Routes (unchanged)
 app.get('/', (req, res) => res.send('SMS Marketing API is running.'));
 
 app.get('/api/groups', (req, res) => {
