@@ -26,54 +26,65 @@ db.serialize(() => {
 
 const TALKSASA_API_KEY = process.env.TALKSASA_API_KEY;
 const TALKSASA_SENDER_ID = process.env.TALKSASA_SENDER_ID || 'Talksasa';
-const TALKSASA_API_URLS = [
-  'https://bulksms.talksasa.com/api/v3/sms/send',
-  'https://bulksms.talksasa.com/api/sms/send'
-];
+const TALKSASA_API_URL = 'https://bulksms.talksasa.com/api/v3/sms/send';
 
 async function sendSms(recipientPhone, message) {
   console.log(`[SMS] Sending to ${recipientPhone}`);
-  const payload = {
+  
+  // Try simple string recipient first
+  const payload1 = {
     sender_id: TALKSASA_SENDER_ID,
-    recipients: [{ phone: recipientPhone, name: '' }],
+    recipient: recipientPhone,
     message: message
   };
-
-  for (const url of TALKSASA_API_URLS) {
-    console.log(`[SMS] Trying URL: ${url}`);
+  
+  try {
+    const response = await axios.post(TALKSASA_API_URL, payload1, {
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${TALKSASA_API_KEY}`
+      }
+    });
+    console.log(`[SMS] SUCCESS (string recipient):`, response.data);
+    if (response.data.status === 'success') {
+      return { success: true, messageId: response.data.message_id || response.data.id };
+    } else {
+      console.error(`[SMS] API returned error:`, response.data.message);
+      return { success: false, error: response.data.message };
+    }
+  } catch (error) {
+    console.log(`[SMS] String recipient failed, trying object format...`);
     
-    // Try Bearer token
+    // Try object format
+    const payload2 = {
+      sender_id: TALKSASA_SENDER_ID,
+      recipient: { phone: recipientPhone },
+      message: message
+    };
+    
     try {
-      const response = await axios.post(url, payload, {
+      const response = await axios.post(TALKSASA_API_URL, payload2, {
         headers: {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${TALKSASA_API_KEY}`
         }
       });
-      console.log(`[SMS] SUCCESS with Bearer at ${url}:`, response.data);
-      return { success: true, messageId: response.data.message_id || response.data.id };
-    } catch (bearerError) {
-      console.log(`[SMS] Bearer failed at ${url}, trying api-key...`);
-      try {
-        const response = await axios.post(url, payload, {
-          headers: {
-            'Content-Type': 'application/json',
-            'api-key': TALKSASA_API_KEY
-          }
-        });
-        console.log(`[SMS] SUCCESS with api-key at ${url}:`, response.data);
+      console.log(`[SMS] SUCCESS (object recipient):`, response.data);
+      if (response.data.status === 'success') {
         return { success: true, messageId: response.data.message_id || response.data.id };
-      } catch (apiKeyError) {
-        console.error(`[SMS] api-key failed at ${url}:`, apiKeyError.response?.data || apiKeyError.message);
+      } else {
+        console.error(`[SMS] API returned error:`, response.data.message);
+        return { success: false, error: response.data.message };
       }
+    } catch (finalError) {
+      console.error(`[SMS] Both formats failed.`);
+      console.error(finalError.response?.data || finalError.message);
+      return { success: false, error: finalError.message };
     }
   }
-  
-  console.error(`[SMS] All attempts failed.`);
-  return { success: false, error: 'All authentication methods and URLs failed' };
 }
 
-// API Routes (same as before)
+// API Routes (unchanged)
 app.get('/', (req, res) => res.send('SMS Marketing API is running.'));
 
 app.get('/api/groups', (req, res) => {
