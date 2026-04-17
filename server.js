@@ -3,8 +3,7 @@ const cors = require('cors');
 const bodyParser = require('body-parser');
 const axios = require('axios');
 const cron = require('node-cron');
-const sqlite3 = require('sqlite3').verbose();
-const path = require('path');
+const admin = require('firebase-admin');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -12,191 +11,174 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(bodyParser.json());
 
-const dbPath = path.join(__dirname, 'sms_marketing.db');
-const db = new sqlite3.Database(dbPath);
-
-db.serialize(() => {
-  db.run(`CREATE TABLE IF NOT EXISTS groups (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL)`);
-  db.run(`CREATE TABLE IF NOT EXISTS contacts (id INTEGER PRIMARY KEY AUTOINCREMENT, phone TEXT UNIQUE NOT NULL, first_name TEXT, last_name TEXT, group_id INTEGER, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (group_id) REFERENCES groups (id))`);
-  db.run(`CREATE TABLE IF NOT EXISTS templates (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL, body TEXT NOT NULL)`);
-  db.run(`CREATE TABLE IF NOT EXISTS campaigns (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, message TEXT NOT NULL, group_id INTEGER, scheduled_at DATETIME, repeat_interval TEXT, status TEXT DEFAULT 'draft', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (group_id) REFERENCES groups (id))`);
-  db.run(`CREATE TABLE IF NOT EXISTS campaign_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, campaign_id INTEGER, contact_id INTEGER, message_id TEXT, status TEXT, cost REAL, sent_at DATETIME DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (campaign_id) REFERENCES campaigns (id), FOREIGN KEY (contact_id) REFERENCES contacts (id))`);
-  db.get("SELECT id FROM groups WHERE name = 'All Contacts'", (err, row) => { if (!row) db.run("INSERT INTO groups (name) VALUES ('All Contacts')"); });
-});
+// Initialize Firebase Admin SDK
+const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+const db = admin.firestore();
 
 const TALKSASA_API_KEY = process.env.TALKSASA_API_KEY;
-const TALKSASA_SENDER_ID = process.env.TALKSASA_SENDER_ID || ''; // Optional now
+const TALKSASA_SENDER_ID = process.env.TALKSASA_SENDER_ID || '';
 const TALKSASA_API_URL = 'https://bulksms.talksasa.com/api/v3/sms/send';
 
 function formatPhoneNumber(phone) {
   let cleaned = phone.replace(/\s+/g, '').replace(/[()-]/g, '');
   if (cleaned.startsWith('+')) cleaned = cleaned.substring(1);
-  if (cleaned.startsWith('0')) {
-    cleaned = '254' + cleaned.substring(1);
-  } else if (!cleaned.startsWith('254')) {
-    cleaned = '254' + cleaned;
-  }
+  if (cleaned.startsWith('0')) cleaned = '254' + cleaned.substring(1);
+  else if (!cleaned.startsWith('254')) cleaned = '254' + cleaned;
   return cleaned;
 }
 
 async function sendSms(recipientPhone, message) {
   const formattedPhone = formatPhoneNumber(recipientPhone);
-  console.log(`[SMS] Sending to ${formattedPhone}`);
-  
-  const payload = {
-    recipient: formattedPhone,
-    message: message
-  };
-  
-  // Only include sender_id if it's set in environment
-  if (TALKSASA_SENDER_ID && TALKSASA_SENDER_ID.trim() !== '') {
-    payload.sender_id = TALKSASA_SENDER_ID;
-  }
-  
+  const payload = { recipient: formattedPhone, message };
+  if (TALKSASA_SENDER_ID) payload.sender_id = TALKSASA_SENDER_ID;
   try {
     const response = await axios.post(TALKSASA_API_URL, payload, {
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${TALKSASA_API_KEY}`
-      }
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${TALKSASA_API_KEY}` }
     });
-    console.log(`[SMS] Response:`, response.data);
-    if (response.data.status === 'success') {
-      return { success: true, messageId: response.data.message_id || response.data.id };
-    } else {
-      return { success: false, error: response.data.message };
-    }
+    return { success: response.data.status === 'success', messageId: response.data.data?.uid };
   } catch (error) {
-    console.error(`[SMS] Failed:`, error.response?.data || error.message);
     return { success: false, error: error.message };
   }
 }
 
-// API Routes (unchanged)
+// Middleware to authenticate user token
+async function authenticateUser(req, res, next) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return res.status(401).json({ error: 'Missing authorization header' });
+  const token = authHeader.replace('Bearer ', '');
+  try {
+    const decodedToken = await admin.auth().verifyIdToken(token);
+    req.user = decodedToken;
+    next();
+  } catch (error) {
+    return res.status(401).json({ error: 'Invalid token' });
+  }
+}
+
+// Routes
 app.get('/', (req, res) => res.send('SMS Marketing API is running.'));
 
-app.get('/api/groups', (req, res) => {
-  db.all("SELECT * FROM groups", (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json(rows);
-  });
+app.get('/api/groups', authenticateUser, async (req, res) => {
+  const snapshot = await db.collection('groups').where('userId', '==', req.user.uid).get();
+  const groups = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+  res.json(groups);
 });
 
-app.post('/api/groups', (req, res) => {
+app.post('/api/groups', authenticateUser, async (req, res) => {
   const { name } = req.body;
-  if (!name) return res.status(400).json({ error: 'Group name required' });
-  db.run("INSERT INTO groups (name) VALUES (?)", [name], function(err) {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json({ id: this.lastID, name });
-  });
+  const docRef = await db.collection('groups').add({ userId: req.user.uid, name, createdAt: admin.firestore.FieldValue.serverTimestamp() });
+  const doc = await docRef.get();
+  res.json({ id: doc.id, ...doc.data() });
 });
 
-app.get('/api/contacts', (req, res) => {
-  const { groupId } = req.query;
-  let query = "SELECT * FROM contacts";
-  let params = [];
-  if (groupId) { query += " WHERE group_id = ?"; params.push(groupId); }
-  db.all(query, params, (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json(rows);
-  });
+app.delete('/api/groups/:id', authenticateUser, async (req, res) => {
+  const { id } = req.params;
+  const docRef = db.collection('groups').doc(id);
+  const doc = await docRef.get();
+  if (!doc.exists || doc.data().userId !== req.user.uid) return res.status(403).json({ error: 'Unauthorized' });
+  await docRef.delete();
+  res.json({ success: true });
 });
 
-app.post('/api/contacts', (req, res) => {
+app.get('/api/contacts', authenticateUser, async (req, res) => {
+  const snapshot = await db.collection('contacts').where('userId', '==', req.user.uid).get();
+  const contacts = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+  res.json(contacts);
+});
+
+app.post('/api/contacts', authenticateUser, async (req, res) => {
   const { phone, first_name, last_name, group_id } = req.body;
-  if (!phone) return res.status(400).json({ error: 'Phone number required' });
-  db.run("INSERT INTO contacts (phone, first_name, last_name, group_id) VALUES (?, ?, ?, ?)",
-    [phone, first_name || '', last_name || '', group_id || 1],
-    function(err) {
-      if (err) return res.status(500).json({ error: err.message });
-      res.json({ id: this.lastID, phone, first_name, last_name, group_id });
-    });
-});
-
-app.get('/api/templates', (req, res) => {
-  db.all("SELECT * FROM templates", (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json(rows);
+  if (!phone || !group_id) return res.status(400).json({ error: 'Phone and group required' });
+  const docRef = await db.collection('contacts').add({
+    userId: req.user.uid, phone, first_name: first_name || '', last_name: last_name || '', groupId: group_id, blocked: false,
+    createdAt: admin.firestore.FieldValue.serverTimestamp()
   });
+  const doc = await docRef.get();
+  res.json({ id: doc.id, ...doc.data() });
 });
 
-app.post('/api/templates', (req, res) => {
+app.patch('/api/contacts/:id', authenticateUser, async (req, res) => {
+  const { id } = req.params;
+  const docRef = db.collection('contacts').doc(id);
+  const doc = await docRef.get();
+  if (!doc.exists || doc.data().userId !== req.user.uid) return res.status(403).json({ error: 'Unauthorized' });
+  await docRef.update(req.body);
+  const updated = await docRef.get();
+  res.json({ id: updated.id, ...updated.data() });
+});
+
+app.delete('/api/contacts/:id', authenticateUser, async (req, res) => {
+  const { id } = req.params;
+  const docRef = db.collection('contacts').doc(id);
+  const doc = await docRef.get();
+  if (!doc.exists || doc.data().userId !== req.user.uid) return res.status(403).json({ error: 'Unauthorized' });
+  await docRef.delete();
+  res.json({ success: true });
+});
+
+app.get('/api/templates', authenticateUser, async (req, res) => {
+  const snapshot = await db.collection('templates').where('userId', '==', req.user.uid).get();
+  const templates = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+  res.json(templates);
+});
+
+app.post('/api/templates', authenticateUser, async (req, res) => {
   const { name, body } = req.body;
-  if (!name || !body) return res.status(400).json({ error: 'Name and body required' });
-  db.run("INSERT INTO templates (name, body) VALUES (?, ?)", [name, body], function(err) {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json({ id: this.lastID, name, body });
+  const docRef = await db.collection('templates').add({ userId: req.user.uid, name, body, createdAt: admin.firestore.FieldValue.serverTimestamp() });
+  const doc = await docRef.get();
+  res.json({ id: doc.id, ...doc.data() });
+});
+
+app.get('/api/campaigns', authenticateUser, async (req, res) => {
+  const snapshot = await db.collection('campaigns').where('userId', '==', req.user.uid).orderBy('createdAt', 'desc').get();
+  const campaigns = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+  res.json(campaigns);
+});
+
+app.post('/api/campaigns', authenticateUser, async (req, res) => {
+  const { name, message, group_ids, scheduled_at, repeat_interval } = req.body;
+  const docRef = await db.collection('campaigns').add({
+    userId: req.user.uid, name, message, groupIds: group_ids, scheduledAt: scheduled_at, repeatInterval: repeat_interval,
+    status: 'scheduled', createdAt: admin.firestore.FieldValue.serverTimestamp()
   });
+  const doc = await docRef.get();
+  res.json({ id: doc.id, ...doc.data() });
 });
 
-app.get('/api/campaigns', (req, res) => {
-  db.all("SELECT * FROM campaigns ORDER BY created_at DESC", (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json(rows);
-  });
-});
-
-app.post('/api/campaigns', (req, res) => {
-  const { name, message, group_id, scheduled_at, repeat_interval } = req.body;
-  if (!name || !message || !group_id) return res.status(400).json({ error: 'Missing fields' });
-  db.run("INSERT INTO campaigns (name, message, group_id, scheduled_at, repeat_interval, status) VALUES (?, ?, ?, ?, ?, ?)",
-    [name, message, group_id, scheduled_at || new Date().toISOString(), repeat_interval || 'none', 'scheduled'],
-    function(err) {
-      if (err) return res.status(500).json({ error: err.message });
-      res.json({ id: this.lastID });
-    });
-});
-
-app.get('/api/reports', (req, res) => {
-  const query = `
-    SELECT c.name as campaign_name, COUNT(cl.id) as sent_count,
-           SUM(CASE WHEN cl.status = 'sent' THEN 1 ELSE 0 END) as delivered_count,
-           SUM(cl.cost) as total_cost
-    FROM campaign_logs cl
-    JOIN campaigns c ON cl.campaign_id = c.id
-    GROUP BY c.id ORDER BY c.created_at DESC
-  `;
-  db.all(query, (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json(rows);
-  });
-});
-
-cron.schedule('* * * * *', () => {
+// Cron job: runs every minute
+cron.schedule('* * * * *', async () => {
   console.log('[CRON] Checking scheduled campaigns...');
   const now = new Date().toISOString();
-  db.all("SELECT * FROM campaigns WHERE status = 'scheduled' AND scheduled_at <= ?", [now], async (err, campaigns) => {
-    if (err || !campaigns.length) return;
-    for (const campaign of campaigns) {
-      console.log(`[CRON] Processing: ${campaign.name}`);
-      db.all("SELECT * FROM contacts WHERE group_id = ?", [campaign.group_id], async (err, contacts) => {
-        if (err || !contacts.length) return;
-        let success = 0, cost = 0;
-        for (const contact of contacts) {
-          let msg = campaign.message.replace(/{{first_name}}/g, contact.first_name || 'Customer');
-          const result = await sendSms(contact.phone, msg);
-          const status = result.success ? 'sent' : 'failed';
-          if (result.success) success++;
-          cost += 0.35;
-          db.run("INSERT INTO campaign_logs (campaign_id, contact_id, message_id, status, cost) VALUES (?, ?, ?, ?, ?)",
-            [campaign.id, contact.id, result.messageId || null, status, 0.35]);
-          await new Promise(r => setTimeout(r, 150));
-        }
-        console.log(`[CRON] Campaign done. Sent: ${success}, Cost: KES ${cost.toFixed(2)}`);
-        let newStatus = 'completed';
-        if (campaign.repeat_interval && campaign.repeat_interval !== 'none') {
-          newStatus = 'scheduled';
-          const next = new Date(campaign.scheduled_at);
-          if (campaign.repeat_interval === 'daily') next.setDate(next.getDate() + 1);
-          else if (campaign.repeat_interval === 'weekly') next.setDate(next.getDate() + 7);
-          else if (campaign.repeat_interval === 'monthly') next.setMonth(next.getMonth() + 1);
-          db.run("UPDATE campaigns SET scheduled_at = ? WHERE id = ?", [next.toISOString(), campaign.id]);
-        } else {
-          db.run("UPDATE campaigns SET status = ? WHERE id = ?", [newStatus, campaign.id]);
-        }
-      });
+  const snapshot = await db.collection('campaigns').where('status', '==', 'scheduled').where('scheduledAt', '<=', now).get();
+  for (const doc of snapshot.docs) {
+    const campaign = doc.data();
+    console.log(`Processing campaign ${campaign.name}`);
+    const contactsSnapshot = await db.collection('contacts').where('userId', '==', campaign.userId).where('groupId', 'in', campaign.groupIds).where('blocked', '==', false).get();
+    let success = 0;
+    for (const contactDoc of contactsSnapshot.docs) {
+      const contact = contactDoc.data();
+      let msg = campaign.message;
+      msg = msg.replace(/{{first_name}}/g, contact.first_name || 'Customer');
+      msg = msg.replace(/{{last_name}}/g, contact.last_name || '');
+      const nowDate = new Date();
+      msg = msg.replace(/{{date}}/g, nowDate.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }));
+      msg = msg.replace(/{{time}}/g, nowDate.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true }));
+      const result = await sendSms(contact.phone, msg);
+      if (result.success) success++;
+      await new Promise(r => setTimeout(r, 150));
     }
-  });
+    console.log(`Campaign ${campaign.name} done. Sent: ${success}`);
+    if (campaign.repeatInterval && campaign.repeatInterval !== 'none') {
+      let next = new Date(campaign.scheduledAt);
+      if (campaign.repeatInterval === 'daily') next.setDate(next.getDate() + 1);
+      else if (campaign.repeatInterval === 'weekly') next.setDate(next.getDate() + 7);
+      else if (campaign.repeatInterval === 'monthly') next.setMonth(next.getMonth() + 1);
+      await doc.ref.update({ scheduledAt: next.toISOString() });
+    } else {
+      await doc.ref.update({ status: 'completed' });
+    }
+  }
 });
 
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
