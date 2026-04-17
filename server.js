@@ -11,13 +11,17 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(bodyParser.json());
 
-// Initialize Firebase Admin SDK
+// Initialize Firebase Admin
+if (!process.env.FIREBASE_SERVICE_ACCOUNT) {
+  console.error('FIREBASE_SERVICE_ACCOUNT environment variable is missing!');
+  process.exit(1);
+}
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 const db = admin.firestore();
 
 const TALKSASA_API_KEY = process.env.TALKSASA_API_KEY;
-const TALKSASA_SENDER_ID = process.env.TALKSASA_SENDER_ID || '';
+const TALKSASA_SENDER_ID = process.env.TALKSASA_SENDER_ID || 'TALK-SASA';
 const TALKSASA_API_URL = 'https://bulksms.talksasa.com/api/v3/sms/send';
 
 function formatPhoneNumber(phone) {
@@ -42,7 +46,6 @@ async function sendSms(recipientPhone, message) {
   }
 }
 
-// Middleware to authenticate user token
 async function authenticateUser(req, res, next) {
   const authHeader = req.headers.authorization;
   if (!authHeader) return res.status(401).json({ error: 'Missing authorization header' });
@@ -56,13 +59,11 @@ async function authenticateUser(req, res, next) {
   }
 }
 
-// Routes
 app.get('/', (req, res) => res.send('SMS Marketing API is running.'));
 
 app.get('/api/groups', authenticateUser, async (req, res) => {
   const snapshot = await db.collection('groups').where('userId', '==', req.user.uid).get();
-  const groups = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-  res.json(groups);
+  res.json(snapshot.docs.map(d => ({ id: d.id, ...d.data() })));
 });
 
 app.post('/api/groups', authenticateUser, async (req, res) => {
@@ -72,19 +73,9 @@ app.post('/api/groups', authenticateUser, async (req, res) => {
   res.json({ id: doc.id, ...doc.data() });
 });
 
-app.delete('/api/groups/:id', authenticateUser, async (req, res) => {
-  const { id } = req.params;
-  const docRef = db.collection('groups').doc(id);
-  const doc = await docRef.get();
-  if (!doc.exists || doc.data().userId !== req.user.uid) return res.status(403).json({ error: 'Unauthorized' });
-  await docRef.delete();
-  res.json({ success: true });
-});
-
 app.get('/api/contacts', authenticateUser, async (req, res) => {
   const snapshot = await db.collection('contacts').where('userId', '==', req.user.uid).get();
-  const contacts = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-  res.json(contacts);
+  res.json(snapshot.docs.map(d => ({ id: d.id, ...d.data() })));
 });
 
 app.post('/api/contacts', authenticateUser, async (req, res) => {
@@ -98,29 +89,9 @@ app.post('/api/contacts', authenticateUser, async (req, res) => {
   res.json({ id: doc.id, ...doc.data() });
 });
 
-app.patch('/api/contacts/:id', authenticateUser, async (req, res) => {
-  const { id } = req.params;
-  const docRef = db.collection('contacts').doc(id);
-  const doc = await docRef.get();
-  if (!doc.exists || doc.data().userId !== req.user.uid) return res.status(403).json({ error: 'Unauthorized' });
-  await docRef.update(req.body);
-  const updated = await docRef.get();
-  res.json({ id: updated.id, ...updated.data() });
-});
-
-app.delete('/api/contacts/:id', authenticateUser, async (req, res) => {
-  const { id } = req.params;
-  const docRef = db.collection('contacts').doc(id);
-  const doc = await docRef.get();
-  if (!doc.exists || doc.data().userId !== req.user.uid) return res.status(403).json({ error: 'Unauthorized' });
-  await docRef.delete();
-  res.json({ success: true });
-});
-
 app.get('/api/templates', authenticateUser, async (req, res) => {
   const snapshot = await db.collection('templates').where('userId', '==', req.user.uid).get();
-  const templates = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-  res.json(templates);
+  res.json(snapshot.docs.map(d => ({ id: d.id, ...d.data() })));
 });
 
 app.post('/api/templates', authenticateUser, async (req, res) => {
@@ -130,14 +101,9 @@ app.post('/api/templates', authenticateUser, async (req, res) => {
   res.json({ id: doc.id, ...doc.data() });
 });
 
-app.get('/api/campaigns', authenticateUser, async (req, res) => {
-  const snapshot = await db.collection('campaigns').where('userId', '==', req.user.uid).orderBy('createdAt', 'desc').get();
-  const campaigns = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-  res.json(campaigns);
-});
-
 app.post('/api/campaigns', authenticateUser, async (req, res) => {
   const { name, message, group_ids, scheduled_at, repeat_interval } = req.body;
+  if (!name || !message || !group_ids?.length) return res.status(400).json({ error: 'Missing required fields' });
   const docRef = await db.collection('campaigns').add({
     userId: req.user.uid, name, message, groupIds: group_ids, scheduledAt: scheduled_at, repeatInterval: repeat_interval,
     status: 'scheduled', createdAt: admin.firestore.FieldValue.serverTimestamp()
@@ -146,29 +112,22 @@ app.post('/api/campaigns', authenticateUser, async (req, res) => {
   res.json({ id: doc.id, ...doc.data() });
 });
 
-// Cron job: runs every minute
 cron.schedule('* * * * *', async () => {
-  console.log('[CRON] Checking scheduled campaigns...');
+  console.log('[CRON] Checking campaigns...');
   const now = new Date().toISOString();
   const snapshot = await db.collection('campaigns').where('status', '==', 'scheduled').where('scheduledAt', '<=', now).get();
   for (const doc of snapshot.docs) {
     const campaign = doc.data();
-    console.log(`Processing campaign ${campaign.name}`);
-    const contactsSnapshot = await db.collection('contacts').where('userId', '==', campaign.userId).where('groupId', 'in', campaign.groupIds).where('blocked', '==', false).get();
-    let success = 0;
-    for (const contactDoc of contactsSnapshot.docs) {
-      const contact = contactDoc.data();
-      let msg = campaign.message;
-      msg = msg.replace(/{{first_name}}/g, contact.first_name || 'Customer');
-      msg = msg.replace(/{{last_name}}/g, contact.last_name || '');
+    const contactsSnap = await db.collection('contacts').where('userId', '==', campaign.userId).where('groupId', 'in', campaign.groupIds).where('blocked', '==', false).get();
+    for (const cDoc of contactsSnap.docs) {
+      const contact = cDoc.data();
+      let msg = campaign.message.replace(/{{first_name}}/g, contact.first_name || 'Customer');
       const nowDate = new Date();
       msg = msg.replace(/{{date}}/g, nowDate.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }));
       msg = msg.replace(/{{time}}/g, nowDate.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true }));
-      const result = await sendSms(contact.phone, msg);
-      if (result.success) success++;
+      await sendSms(contact.phone, msg);
       await new Promise(r => setTimeout(r, 150));
     }
-    console.log(`Campaign ${campaign.name} done. Sent: ${success}`);
     if (campaign.repeatInterval && campaign.repeatInterval !== 'none') {
       let next = new Date(campaign.scheduledAt);
       if (campaign.repeatInterval === 'daily') next.setDate(next.getDate() + 1);
